@@ -276,6 +276,7 @@ it("does not follow a cross-origin redirect carrying the Authorization Header", 
     expect(await list!({}, executionContext())).toMatchObject({ ok: false });
     expect(host.requests).toHaveLength(1);
     expect(host.requests[0]!.url).toBe(endpoint);
+    expect(host.requests[0]!.redirect).toBe("manual");
     expect(host.requests[0]!.headers.get("authorization")).toBe(`Bearer ${syntheticKey}`);
   } finally {
     await host.close();

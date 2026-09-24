@@ -8,7 +8,9 @@ import { callMcpTool, listMcpTools } from "../mcp-tools.ts";
 import {
   defineApiKeyProviderExecutors,
   mapProviderActionHandlers,
+  providerInputError,
   ProviderRequestError,
+  providerResponseError,
   requiredInputString,
 } from "../provider-runtime.ts";
 import { baizhiMcpActions } from "./actions.ts";
@@ -29,7 +31,7 @@ const handlers = mapProviderActionHandlers(
 
     const toolName = requiredInputString(input.toolName, "toolName");
     if (!allowedToolNames.has(toolName)) {
-      throw new ProviderRequestError(400, "Only Baizhi web search, page reading, and extraction tools are supported");
+      throw providerInputError("Only Baizhi web search, page reading, and extraction tools are supported");
     }
     return {
       result: await safeMcpRequest(context.apiKey, () =>
@@ -39,7 +41,7 @@ const handlers = mapProviderActionHandlers(
           arguments: optionalRecord(input.arguments) ?? {},
           authorizeTool(tool) {
             if (!tool || !isReadableTool(tool)) {
-              throw new ProviderRequestError(400, `Baizhi MCP tool ${toolName} is unavailable or not read-only`);
+              throw providerInputError(`Baizhi MCP tool ${toolName} is unavailable or not read-only`);
             }
           },
         }),
@@ -55,13 +57,11 @@ export const executors: ProviderExecutors = defineApiKeyProviderExecutors(servic
 export const credentialValidators: CredentialValidators = {
   async apiKey(input, { fetcher, signal }) {
     const key = requiredInputString(input.apiKey, "Baizhi API Key");
-    const tools = await safeMcpRequest(
-      key,
-      () => listMcpTools(connectionInput(key, fetcher, signal), { includeAnnotations: true }),
-      true,
+    const tools = await safeMcpRequest(key, () =>
+      listMcpTools(connectionInput(key, fetcher, signal), { includeAnnotations: true }),
     );
     if (selectReadableTools(tools).length === 0) {
-      throw new ProviderRequestError(400, "Baizhi MCP did not advertise a supported read-only web tool");
+      throw providerInputError("Baizhi MCP did not advertise a supported read-only web tool");
     }
     const hash = sha256Hex(key).slice(0, 16);
     return {
@@ -74,14 +74,15 @@ export const credentialValidators: CredentialValidators = {
 function connectionInput(key: string, fetcher: ProviderFetch, signal?: AbortSignal): McpToolOptions {
   const apiKey = requiredInputString(key, "Baizhi API Key");
   if (/^Bearer\s+/i.test(apiKey)) {
-    throw new ProviderRequestError(400, "Paste the Baizhi API Key without the Bearer prefix");
+    throw providerInputError("Paste the Baizhi API Key without the Bearer prefix");
   }
   return {
     endpoint,
     service: "Baizhi",
     fetcher,
     headers: { authorization: `Bearer ${apiKey}` },
-    redirect: "error",
+    // Cloudflare Workers rejects `redirect: "error"`; a 3xx under "manual" still fails the MCP request.
+    redirect: "manual",
     terminateSession: true,
     signal,
     maxResponseBytes: 8 * 1024 * 1024,
@@ -104,24 +105,26 @@ function selectReadableTools(tools: McpToolSummary[]): McpToolSummary[] {
   const names = new Set<string>();
   for (const tool of selected) {
     if (names.has(tool.name)) {
-      throw new ProviderRequestError(502, "Baizhi MCP tools/list returned duplicate web tool names");
+      throw providerResponseError("Baizhi MCP tools/list returned duplicate web tool names");
     }
     names.add(tool.name);
   }
   return selected.filter(isReadableTool);
 }
 
-async function safeMcpRequest<T>(key: string, request: () => Promise<T>, validatingCredential = false): Promise<T> {
+/**
+ * Redact the API Key from MCP errors, which can echo upstream response bodies.
+ * The shared MCP mapper tags 401/403 as provider_error; clearing that code lets
+ * the runtime report them as authorization_failed.
+ */
+async function safeMcpRequest<T>(key: string, request: () => Promise<T>): Promise<T> {
   try {
     return await request();
   } catch (error) {
     if (!(error instanceof ProviderRequestError)) throw error;
     const rawKey = key.trim();
-    const encodedKey = encodeURIComponent(rawKey);
-    const message = error.message.split(rawKey).join("[redacted]").split(encodedKey).join("[redacted]");
-    const unauthorized = error.status === 401 || error.status === 403;
-    const status = validatingCredential && unauthorized ? 400 : error.status;
-    const code = unauthorized ? (validatingCredential ? "invalid_input" : "authorization_failed") : error.code;
-    throw new ProviderRequestError(status, message, undefined, code);
+    const message = error.message.split(rawKey).join("[redacted]").split(encodeURIComponent(rawKey)).join("[redacted]");
+    const code = error.status === 401 || error.status === 403 ? undefined : error.code;
+    throw new ProviderRequestError(error.status, message, error.details, code);
   }
 }
